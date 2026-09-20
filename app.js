@@ -1,8 +1,8 @@
 // ── Config ──
 const DROPBOX_CLIENT_ID = '0kfnwj8hluxzpun';
 // PKCE(공개 클라이언트) 방식이므로 app secret은 코드에 두지 않는다 (공개 저장소 노출 방지)
-const DROPBOX_FILE = '/memo-app/memos.json';
-const BACKUP_DIR = '/memo-app/backups';
+const DROPBOX_FILE = '/project-papers/memos.json';
+const BACKUP_DIR = '/project-papers/backups';
 const BACKUP_MAX = 30;
 const REDIRECT_URI = location.origin + location.pathname;
 
