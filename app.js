@@ -689,6 +689,7 @@ async function syncFromDropbox() {
   setSyncStatus('syncing', '동기화 중...');
   try {
     const remote = await dbxDownload();
+    const remoteMissing = (remote === null);
     if (remote && typeof remote === 'object' && !Array.isArray(remote)) {
       if (Array.isArray(remote.deletedIds)) deletedIds = mergeDeletedIds(deletedIds, remote.deletedIds);
       if (Array.isArray(remote.trash)) trash = mergeTrash(trash, remote.trash);
@@ -700,6 +701,14 @@ async function syncFromDropbox() {
       memos = mergeMemos(memos, remote);
     }
     saveLocalData();
+    // Dropbox 에 파일이 없는데 이 기기도 비어 있으면, 빈 파일을 만들지 않고 멈춘다.
+    // (저장 경로가 어긋났을 때 빈 파일이 생겨 노트가 사라진 것처럼 보이는 사고 방지)
+    if (remoteMissing && isLocalEmpty()) {
+      setSyncStatus('error', '저장 파일 없음');
+      showToast('Dropbox에서 저장 파일을 찾지 못했습니다. 빈 내용을 올리지 않았습니다.');
+      renderAll();
+      return;
+    }
     await syncToDropbox();
     setSyncStatus('synced', '동기화 완료');
     renderAll();
@@ -713,8 +722,20 @@ async function syncFromDropbox() {
   }
 }
 
-async function syncToDropbox() {
+// 이 기기에 내용이 하나도 없는 상태인가(글·폴더·템플릿·휴지통 모두 빔)
+function isLocalEmpty() {
+  return memos.length === 0 && folders.length === 0 && templates.length === 0 && trash.length === 0;
+}
+
+// force=true 는 사용자가 직접 전부 지운 경우처럼 빈 상태를 일부러 올릴 때만
+async function syncToDropbox(force) {
   if (!accessToken) return;
+  // 안전장치: 빈 내용으로 Dropbox 파일을 덮어쓰지 않는다.
+  // (경로가 어긋나거나 로그인 직후 아직 못 받아온 상태에서 올리면 원격 노트가 날아간다)
+  if (!force && isLocalEmpty()) {
+    console.warn('빈 상태라 업로드를 건너뜀');
+    return;
+  }
   const obj = { memos, folders, trash, deletedIds, templates };
   if (masterPasswordHash) obj.masterPassword = masterPasswordHash;
   const data = JSON.stringify(obj, null, 2);
