@@ -1600,9 +1600,24 @@ function showEditor(memo) {
   // 이전 글에서 쓰던 찾기 표시 초기화 후, 이 글의 형광펜을 오버레이에 그림
   searchKeyword = ''; searchCurrentPos = -1; findMatches = []; findIndex = -1; findAllMode = false;
   repaintOverlay();
+  // 뒤로가기(모바일 제스처)가 앱을 끄지 않고 글을 먼저 닫도록 기록 한 칸을 쌓아 둔다(글을 바꿔 열 때는 더 쌓지 않음)
+  if (!(history.state && history.state.memoOpen)) history.pushState({ memoOpen: true }, '');
 }
 
+// 뒤로가기 → 열린 글을 닫고 빈 화면(There you are)으로. 빈 화면에서 한 번 더 뒤로가기 → 앱 종료
+let skipNextPopstate = false;
+window.addEventListener('popstate', () => {
+  if (skipNextPopstate) { skipNextPopstate = false; return; }
+  $('#sidebar').classList.remove('open');
+  if (editorContainer.style.display === 'none') return;
+  hideEditor();
+  currentId = null;
+  renderMemoList();
+});
+
 function hideEditor() {
+  // 삭제 등 다른 이유로 글이 닫히면 쌓아 둔 기록 칸도 거둬, 다음 뒤로가기가 헛돌지 않게 한다
+  if (history.state && history.state.memoOpen) { skipNextPopstate = true; history.back(); }
   cleanupEmptyMemo();
   editorToolbar.style.display = 'none';
   editorContainer.style.display = 'none';
