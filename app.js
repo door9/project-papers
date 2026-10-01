@@ -4,7 +4,8 @@ const DROPBOX_CLIENT_ID = '0kfnwj8hluxzpun';
 const DROPBOX_FILE = '/project-papers/memos.json';
 // 동기화 규칙 버전. 옛 앱이 새 규칙의 데이터를 망가뜨릴 수 있게 바뀔 때만 올린다.
 // 파일의 dataVersion이 이 값보다 크면 이 앱은 올리지 않고 새로고침을 안내한다.
-const DATA_VERSION = 2;
+// 3: 글 버전을 시각이 아니라 내용 지문(ver)·계보(anc)로 가린다 — 시각만 보는 옛 앱이 되돌리지 못하게
+const DATA_VERSION = 3;
 let outdatedClient = false;
 function markOutdated() {
   if (outdatedClient) return;
@@ -47,6 +48,8 @@ let localSaveTimer = null;
 const getRev = () => localStorage.getItem('dbx_rev') || null;
 const getSyncBase = () => { try { return JSON.parse(localStorage.getItem('sync_base') || '{}'); } catch { return {}; } };
 const isDirty = () => localStorage.getItem('pending_sync') === '1';
+let changeSeq = 0;   // 이 기기에서 고칠 때마다 1씩 — 올리는 동안 또 고쳤는지 가린다
+let reloadingForUpdate = false;
 function setRev(rev) {
   if (rev) localStorage.setItem('dbx_rev', rev); else localStorage.removeItem('dbx_rev');
 }
@@ -140,8 +143,10 @@ async function init() {
   window.addEventListener('pagehide', flushSave);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') { flushSave(); return; }
-    // 돌아왔을 때: 못 보낸 변경을 올리고 다른 기기에서 고친 것을 받아 온다
+    // 돌아왔을 때: 새 버전이 나왔는지 보고(나왔으면 새 코드로 다시 연다),
+    // 못 보낸 변경을 올리고 다른 기기에서 고친 것을 받아 온다
     // (매번 받지는 않는다 — 파일이 커서 탭을 오갈 때마다 받으면 느리다)
+    checkForUpdate();
     if (accessToken && (isDirty() || Date.now() - lastPullAt > 30000)) syncFromDropbox();
   });
 
@@ -322,6 +327,12 @@ async function init() {
       if (!accessToken) { isOnline = false; showApp(); }
       loadMemoInEditor(memo);
     }
+  } else {
+    // 새 버전으로 다시 열린 경우 쓰던 글을 다시 연다
+    const reopenId = sessionStorage.getItem('reopen_memo');
+    sessionStorage.removeItem('reopen_memo');
+    const memo = reopenId && memos.find((m) => m.id === reopenId);
+    if (memo && accessToken) loadMemoInEditor(memo);
   }
 }
 
@@ -775,11 +786,110 @@ function reconcileTrash() {
   if (dropFolder.size) folders = folders.filter((f) => !dropFolder.has(f.id));
 }
 
+// ── 글 버전 가리기 ──
+// 시각(updatedAt)은 '안 고친 옛 내용'에도 찍힐 수 있다(옛 앱, 편집기에 남은 옛 내용 등).
+// 그래서 어느 쪽이 새 버전인지는 내용 지문으로 가린다.
+//   ver = 이 글을 마지막으로 올릴 때 내용의 지문, anc = 그 전에 거쳐 온 지문들(최근 것부터)
+// 한쪽의 지금 내용이 다른 쪽이 이미 지나온 지문이면, 시각이 아무리 늦어도 뒤처진 사본이다.
+
+// 글자열 지문(53비트). 같은 내용이면 어느 기기에서나 같은 값
+function textHash(s) {
+  let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 2654435761);
+    h2 = Math.imul(h2 ^ c, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+}
+const hashCache = new WeakMap();
+// 글 지문 = 제목+본문. 폴더·형광펜·즐겨찾기는 넣지 않는다
+function memoHash(m) {
+  const c = hashCache.get(m);
+  if (c && c.t === m.title && c.c === m.content) return c.h;
+  const h = textHash((m.title || '') + '\u0000' + (m.content || ''));
+  hashCache.set(m, { t: m.title, c: m.content, h });
+  return h;
+}
+
+const ANC_MAX = 100;
+// 올리기 직전, 내용이 바뀐 글에 새 지문을 새기고 이전 지문을 계보 맨 앞에 넣는다. 바뀐 게 있으면 true
+function stampLineage(list) {
+  const base = getSyncBase();
+  let changed = false;
+  for (const m of list) {
+    const h = memoHash(m);
+    if (m.ver === h) continue;
+    // 처음 새길 때는 지난 동기화 때 지문을 이전 버전으로 삼는다
+    const prev = m.ver || baseOf(base, m.id).h;
+    if (prev && prev !== h) m.anc = [prev].concat((m.anc || []).filter((x) => x !== prev && x !== h)).slice(0, ANC_MAX);
+    m.ver = h;
+    changed = true;
+  }
+  return changed;
+}
+
+// 이 글이 거쳐 온 버전들의 지문 — 지금 내용이 맨 앞, 옛것일수록 뒤
+function lineageOf(m) {
+  const h = memoHash(m);
+  const list = [h];
+  if (m.ver && m.ver !== h) list.push(m.ver);   // 올린 뒤 이 기기에서 더 고쳤다
+  for (const x of m.anc || []) if (x !== h) list.push(x);
+  return list;
+}
+
+// a의 지금 내용이 b가 예전에 거쳐 온 버전이고, a는 그 뒤의 b 버전을 본 적이 없다 → a는 뒤처진 사본
+function isBehind(a, b) {
+  const la = lineageOf(a), lb = lineageOf(b);
+  const i = lb.indexOf(la[0]);
+  if (i < 1) return false;
+  const newer = new Set(lb.slice(0, i));
+  return !la.some((x, k) => k > 0 && newer.has(x));
+}
+
+// 기준점(sync_base) 한 칸 읽기. 글은 { t: 시각, h: 지문 }, 예전 형식(시각 숫자)도 읽는다
+function baseOf(base, key) {
+  const b = base[key];
+  if (b == null) return { t: null, h: null };
+  if (typeof b === 'number') return { t: b, h: null };
+  return { t: b.t, h: b.h || null };
+}
+
+// 지난 동기화 이후 이 기기에서 안 바뀌었나 — 지문이 있으면 내용으로, 없으면 시각으로
+function sameAsBase(m, b) {
+  if (b.h) return memoHash(m) === b.h;
+  return b.t != null && (m.updatedAt || 0) <= b.t;
+}
+
+// 같은 글의 두 버전 중 무엇을 남길지. 시각은 마지막에만 본다.
+function pickVersion(l, r, b) {
+  const later = (l.updatedAt || 0) >= (r.updatedAt || 0) ? l : r;
+  if (memoHash(l) === memoHash(r)) return { winner: later };
+  if (isBehind(r, l)) return { winner: l };   // 원격은 이 기기가 이미 지나온 옛 버전
+  if (isBehind(l, r)) return { winner: r };   // 이 기기가 뒤처졌다
+  // 지난 동기화 때 버전과 비교 — 한쪽만 바뀌었으면 바뀐 쪽
+  const ls = sameAsBase(l, b), rs = sameAsBase(r, b);
+  if (ls && !rs) return { winner: r };
+  if (rs && !ls) return { winner: l };
+  // 양쪽이 각자 고쳤거나 가릴 근거가 없다 → 늦은 쪽을 본문으로, 다른 쪽은 충돌본으로 남긴다
+  return { winner: later, conflict: true };
+}
+
+// 지금 상태를 다음 합치기의 기준점으로 (글은 시각+지문, 폴더는 시각)
+function baseSnapshot(list) {
+  const base = {};
+  for (const m of list) base[m.id] = { t: m.updatedAt, h: memoHash(m) };
+  for (const f of folders) base['f:' + f.id] = f.updatedAt || 0;
+  return base;
+}
+
 // 이 기기가 지난번 동기화 때 갖고 있던(= 원격에도 있던) 그대로인가.
 // 기준점(sync_base)이 있으면 그것으로, 없으면 마지막 동기화 시각으로 판단한다.
-function syncedAndUnchanged(item, key) {
-  const b = getSyncBase()[key];
-  if (b != null) return (item.updatedAt || 0) <= b;
+function syncedAndUnchanged(item, key, base) {
+  const b = baseOf(base || getSyncBase(), key);
+  if (b.t != null || b.h) return sameAsBase(item, b);
   const last = Number(localStorage.getItem('last_synced_at')) || 0;
   return last > 0 && (item.updatedAt || 0) > 0 && (item.updatedAt || 0) <= last;
 }
@@ -791,7 +901,8 @@ function retireGoneItems(remote) {
   const now = Date.now();
   if (Array.isArray(remote.memos)) {
     const ids = new Set(remote.memos.map((m) => m.id));
-    const gone = memos.filter((m) => !ids.has(m.id) && !isBlankMemo(m) && syncedAndUnchanged(m, m.id));
+    const base = getSyncBase();
+    const gone = memos.filter((m) => !ids.has(m.id) && !isBlankMemo(m) && syncedAndUnchanged(m, m.id, base));
     if (gone.length) {
       for (const m of gone) trash.push({ type: 'memo', data: { ...m }, deletedAt: now });
       const g = new Set(gone.map((m) => m.id));
@@ -836,6 +947,9 @@ async function pullAndMerge() {
   saveLocalData(false);
   if (sameAsRemote(remote)) markSynced();
   else localStorage.setItem('pending_sync', '1');
+  // 합친 즉시 편집기에도 반영한다 — 글은 바뀌었는데 편집기에 옛 내용이 남아 있으면,
+  // 그 위에 한 글자만 쳐도 옛 내용이 '방금 고친 최신'으로 올라간다(예전엔 올리기가 끝난 뒤에야 반영했다)
+  refreshOpenMemo();
   return remote === null;
 }
 
@@ -901,30 +1015,36 @@ async function uploadNow(force, retriedConflict) {
     return;
   }
   // 아직 아무것도 안 쓴 빈 글은 올리지 않는다 — 기기마다 지웠다 되살렸다 하며 전송만 늘었다
-  const obj = { memos: syncableMemos(), folders, trash, deletedIds, templates, masterPasswordAt, dataVersion: DATA_VERSION };
+  const list = syncableMemos();
+  // 내용이 바뀐 글에 새 지문·계보를 새긴다(다른 기기가 뒤처진 사본을 가려내는 근거)
+  if (stampLineage(list) || localSaveTimer) saveLocalData(false);
+  const obj = { memos: list, folders, trash, deletedIds, templates, masterPasswordAt, dataVersion: DATA_VERSION };
   if (masterPasswordHash) obj.masterPassword = masterPasswordHash;
+  const body = JSON.stringify(obj);   // 들여쓰기 없이 — 올리는 양이 줄어 휴대폰에서 끊길 일이 적다
+  // 기준점은 '올린 그 순간'의 상태로 — 올리는 동안 고친 것까지 '동기화됨'으로 적으면 그 수정이 다음 합치기에서 진다
+  const base = baseSnapshot(list);
+  const seq = changeSeq;
   try {
-    await dbxUpload(JSON.stringify(obj));   // 들여쓰기 없이 — 올리는 양이 줄어 휴대폰에서 끊길 일이 적다
+    await dbxUpload(body);
   } catch (e) {
     // 그사이 다른 기기가 올렸으면: 그것을 받아 합친 뒤 합친 내용으로 다시 올린다
     if (e && e.revConflict && !retriedConflict) {
       await pullAndMerge();
       renderAll();
-      refreshOpenMemo();
       return uploadNow(force, true);
     }
     throw e;
   }
-  markSynced();
+  markSynced(base, seq === changeSeq && !localSaveTimer);
 }
 
-// 같은 글을 두 기기가 각자 고쳤을 때(= 둘 다 지난 동기화 시각보다 새 것) 늦게 고친 쪽을 본문으로 두고,
+// 같은 글을 두 기기가 각자 고쳤을 때 늦게 고친 쪽을 본문으로 두고,
 // 진 쪽은 '충돌본'이라는 새 글로 남긴다. 그래야 한쪽 글이 소리 없이 사라지지 않는다.
 function conflictCopy(m) {
   const d = new Date();
   const p = (n) => String(n).padStart(2, '0');
   const stamp = `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-  return {
+  const copy = {
     ...m,
     id: crypto.randomUUID(),
     title: (m.title || '제목 없음') + ` (충돌본 ${stamp})`,
@@ -932,6 +1052,8 @@ function conflictCopy(m) {
     conflictFrom: m.updatedAt,   // 어느 버전의 사본인지 — 사본을 고쳐도 같은 사본을 또 만들지 않게
     updatedAt: Date.now(),
   };
+  delete copy.ver; delete copy.anc;   // 계보는 원본 글의 것 — 사본은 새 글로 시작
+  return copy;
 }
 
 function mergeMemos(local, remote) {
@@ -944,17 +1066,18 @@ function mergeMemos(local, remote) {
   for (const r of remote) {
     const l = localById.get(r.id);
     if (!l) { map.set(r.id, r); continue; }
-    let winner = (l.updatedAt || 0) >= (r.updatedAt || 0) ? l : r;
+    const pick = pickVersion(l, r, baseOf(syncBase, r.id));
+    let winner = pick.winner;
     const loser = winner === l ? r : l;
+    // 뒤처진 쪽에 더 늦은 시각이 찍혀 있었으면 남길 쪽 시각을 그 바로 뒤로 —
+    // 시각만 보는 옛 앱도 같은 버전을 고르고, 목록 순서도 맞는다
+    if ((loser.updatedAt || 0) > (winner.updatedAt || 0)) winner = { ...winner, updatedAt: loser.updatedAt + 1 };
     // 즐겨찾기·보기모드는 글 내용과 따로 — 그쪽을 늦게 바꾼 기기의 값을 따른다
     if ((loser.metaAt || 0) > (winner.metaAt || 0)) {
       winner = { ...winner, favorite: loser.favorite, favoritedAt: loser.favoritedAt, viewerMode: loser.viewerMode, metaAt: loser.metaAt };
     }
     map.set(r.id, winner);
-    const base = syncBase[r.id];
-    const bothEdited = base != null && (l.updatedAt || 0) > base && (r.updatedAt || 0) > base;
-    const differs = l.content !== r.content || l.title !== r.title;
-    if (bothEdited && differs && !copied.has(loser.id + '|' + loser.updatedAt)) {
+    if (pick.conflict && !copied.has(loser.id + '|' + loser.updatedAt)) {
       extras.push(conflictCopy(loser));
       copied.add(loser.id + '|' + loser.updatedAt);
     }
@@ -1021,14 +1144,12 @@ function updateSaveSyncTimes() {
   if (syncedEl) syncedEl.textContent = '최근 동기화 ' + fmtFullTime(localStorage.getItem('last_synced_at'));
 }
 
-function markSynced() {
+// base: 원격과 같아진 상태(올린 그 순간의 상태). 없으면 지금 상태. clean=false면 그 뒤 고친 게 있어 '보낼 것'을 남긴다
+function markSynced(base, clean = true) {
   localStorage.setItem('last_synced_at', String(Date.now()));
-  localStorage.setItem('pending_sync', '0');
-  // 지금 원격과 같아진 내용을 다음 합치기의 기준점으로 삼는다
-  const base = {};
-  for (const m of syncableMemos()) base[m.id] = m.updatedAt;
-  for (const f of folders) base['f:' + f.id] = f.updatedAt || 0;
-  localStorage.setItem('sync_base', JSON.stringify(base));
+  localStorage.setItem('pending_sync', clean ? '0' : '1');
+  // 원격과 같아진 내용을 다음 합치기의 기준점으로 삼는다
+  localStorage.setItem('sync_base', JSON.stringify(base || baseSnapshot(syncableMemos())));
   updateSaveSyncTimes();
 }
 
@@ -1044,7 +1165,7 @@ function saveLocalData(changed = true) {
   else localStorage.removeItem('master_pw');
   localStorage.setItem('master_pw_at', String(masterPasswordAt || 0));
   localStorage.setItem('last_saved_at', String(Date.now()));
-  if (changed) localStorage.setItem('pending_sync', '1');   // 아직 클라우드로 못 보낸 변경이 있다
+  if (changed) { localStorage.setItem('pending_sync', '1'); changeSeq++; }   // 아직 클라우드로 못 보낸 변경이 있다
   updateSaveSyncTimes();
 }
 
@@ -2004,6 +2125,8 @@ function createOfflineCopy(memo) {
 function onEditorInput() {
   let memo = memos.find((m) => m.id === currentId);
   if (!memo) return;
+  // 글자가 실제로 안 바뀐 입력 신호(휴대폰 자판이 낱말을 다시 잡을 때 등)에는 '고친 시각'을 찍지 않는다
+  if (editor.value === memo.content) return;
   // 오프라인 상태에서 편집 시 복사본 생성
   if (!accessToken && !offlineCopyId) {
     memo = createOfflineCopy(memo);
@@ -2026,6 +2149,7 @@ function onEditorInput() {
 function onTitleInput() {
   let memo = memos.find((m) => m.id === currentId);
   if (!memo) return;
+  if (titleInput.value === memo.title) return;
   if (!accessToken && !offlineCopyId) {
     memo = createOfflineCopy(memo);
   }
@@ -2157,24 +2281,26 @@ function scheduleSyncToDropbox() {
 
 // 앱을 닫거나 다른 화면으로 넘어갈 때: 현재 내용을 즉시 기기에 저장 + 대기 중인 클라우드 전송을 바로 실행
 function flushSave() {
-  // 편집 중인 메모가 있을 때만 저장 (메모 미선택 시 빈 상태로 덮어쓰는 것 방지 — 여러 창 동시 사용 대비)
-  if (currentId) {
+  // 본문·제목은 입력할 때마다 바로 글에 반영되므로 여기서 편집기 내용을 글에 옮겨 적지 않는다.
+  // 예전엔 '편집기와 글이 다르면' 옮겨 적으며 고친 시각을 찍었는데, 동기화로 글이 바뀐 직후 편집기에
+  // 남아 있던 옛 내용이 그렇게 '방금 고친 최신'으로 둔갑해 다른 기기의 새 내용을 덮었다.
+  // 그래도 다르다면(정상이면 없는 일) 화면 내용을 잃지 않게 사본으로만 남기고 원본은 건드리지 않는다.
+  if (currentId && !reloadingForUpdate) {
     const memo = memos.find((m) => m.id === currentId);
-    // 내용이 그대로면 '방금 고침' 시각을 찍지 않는다 — 찍으면 옛 내용이 최신으로 둔갑해
-    // 다른 기기에서 고친 새 내용을 덮어쓴다 (모바일에서 열어 둔 채 앱을 닫을 때 실제로 일어났다)
-    if (memo && (memo.content !== editor.value || memo.title !== titleInput.value)) {
-      memo.content = editor.value;
-      memo.title = titleInput.value;
-      memo.updatedAt = Date.now();
+    const lf = (s) => s.replace(/\r\n?/g, '\n');   // 입력칸은 줄바꿈을 \n 으로 바꿔 돌려준다
+    if (memo && (lf(memo.content) !== editor.value || memo.title !== titleInput.value)) {
+      memos.unshift(conflictCopy({ ...memo, content: editor.value, title: titleInput.value }));
       saveLocalData();
+      refreshOpenMemo();
     }
   }
   if (localSaveTimer) saveLocalData();   // 모아 두던 기기 저장을 지금 끝낸다
   // 아직 못 보낸 변경이 있으면 기다리지 않고 지금 바로 보낸다.
   // (예전에는 '대기 중인 전송'이 있을 때만 보내서, 타이핑 1.5초 안에 앱을 벗어나면 아무것도 안 갔다)
+  // 새 버전으로 다시 여는 중이면 올리지 않는다 — 새 코드가 열리자마자 이어서 올린다
   clearTimeout(syncTimer);
   syncTimer = null;
-  if (accessToken && isDirty()) syncToDropbox().catch(() => {});
+  if (accessToken && isDirty() && !reloadingForUpdate) syncToDropbox().catch(() => {});
 }
 
 // ── Viewer Mode ──
@@ -3552,5 +3678,21 @@ function escapeHtml(s) {
 
 // ── Service Worker ──
 if ('serviceWorker' in navigator) {
+  const hadController = !!navigator.serviceWorker.controller;
   navigator.serviceWorker.register('sw.js').catch(() => {});
+  // 새 버전이 깔리면 쓰던 글을 기기에 저장하고 새 코드로 다시 연다.
+  // 휴대폰은 앱을 닫지 않고 오래 띄워 두므로, 배포 뒤에도 옛 코드가 바뀐 동기화 규칙을 모른 채 계속 저장을 올린다
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadController || reloadingForUpdate) return;   // 처음 설치될 때는 다시 열 필요 없음
+    reloadingForUpdate = true;
+    if (localSaveTimer) saveLocalData();
+    if (currentId) sessionStorage.setItem('reopen_memo', currentId);
+    location.reload();
+  });
+}
+
+// 새 버전이 나왔는지 확인 (앱으로 돌아올 때마다). 있으면 설치 → controllerchange → 다시 열기
+function checkForUpdate() {
+  if (!('serviceWorker' in navigator)) return;
+  navigator.serviceWorker.getRegistration().then((r) => r && r.update()).catch(() => {});
 }

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'memo-v146';
+const CACHE_NAME = 'memo-v147';
 const ASSETS = [
   '/project-papers/',
   '/project-papers/index.html',
@@ -42,9 +42,12 @@ self.addEventListener('fetch', (e) => {
     return;
   }
   const isPage = e.request.mode === 'navigate';
+  const sameOrigin = new URL(e.request.url).origin === location.origin;
   // 네트워크 우선 — 단, 통신이 느리면(지하철 등) 4초 뒤 저장해 둔 사본으로 연다.
   // 예전엔 느린 통신에서 연결이 끊길 때까지 하얀 화면으로 기다렸다.
-  const net = fetch(e.request).then((res) => {
+  // 앱 파일은 브라우저 HTTP 캐시(GitHub Pages 10분)를 건너뛰고 서버에 바뀌었는지 묻는다 —
+  // 안 그러면 새 버전으로 다시 열어도 10분 동안 옛 app.js 가 실행될 수 있다.
+  const net = fetch(sameOrigin && !isPage ? new Request(e.request, { cache: 'no-cache' }) : e.request).then((res) => {
     if (res.ok && new URL(e.request.url).origin === location.origin) {
       const clone = res.clone();
       caches.open(CACHE_NAME).then((c) => c.put(e.request, clone));
