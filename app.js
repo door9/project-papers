@@ -46,6 +46,7 @@ function queueSync(fn) {
 }
 const unlockedFolders = new Set(); // 현재 세션에서 잠금 해제된 폴더
 let masterPasswordHash = null;
+let masterPasswordAt = 0;   // Master를 마지막으로 바꾼(설정·해제) 시각 — 기기 사이에서 늦게 바꾼 쪽을 따른다
 let templates = [];
 let undoStack = [];
 let redoStack = [];
@@ -244,13 +245,13 @@ async function init() {
       return;
     }
     // Ctrl+F → 앱 찾기/바꾸기
-    if (e.key === 'f') {
+    if (k === 'f') {
       if (!currentId) return;
       e.preventDefault();
       toggleFindReplace();
     }
     // Ctrl+S → 저장 및 동기화
-    if (e.key === 's') {
+    if (k === 's') {
       e.preventDefault();
       saveLocalData();
       if (accessToken) {
@@ -293,11 +294,8 @@ async function init() {
   searchBox.addEventListener('input', renderMemoList);
 
   document.addEventListener('keydown', (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 's') {
-      e.preventDefault();
-      saveNow();
-    }
-    if ((e.ctrlKey || e.metaKey) && e.key === 'n') {
+    // (Ctrl+S는 위 단축키 처리에서 저장·동기화까지 한다 — 여기서 또 처리하지 않는다)
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n') {
       e.preventDefault();
       createMemo();
     }
@@ -408,17 +406,20 @@ async function refreshAccessToken() {
         client_id: DROPBOX_CLIENT_ID, // PKCE 공개 클라이언트: secret 불필요
       }),
     });
-    if (!res.ok) {
-      console.error('Token refresh failed:', res.status);
+    // 400·401 = 갱신 토큰 자체가 무효(진짜 로그아웃 사유). 그 밖의 실패는 일시적인 것으로 보고 다음에 다시 시도한다.
+    if (res.status === 400 || res.status === 401) {
+      console.error('Token refresh rejected:', res.status);
       return false;
     }
+    if (!res.ok) throw new Error('token refresh failed: ' + res.status);
     const data = await res.json();
     accessToken = data.access_token;
     localStorage.setItem('dbx_token', accessToken);
     return true;
   } catch (e) {
+    // 통신이 잠깐 끊긴 것 — 로그아웃하지 않는다(예전엔 지하철 등에서 로그아웃되고 '(Offline Work)' 사본이 생겼다)
     console.error('Token refresh error:', e);
-    return false;
+    throw e;
   }
 }
 
@@ -508,7 +509,7 @@ async function dbxDownload(retried, attempt = 0) {
       'Dropbox-API-Arg': JSON.stringify({ path: DROPBOX_FILE }),
     },
   });
-  if (res.status === 409 || res.status === 404) return null; // 아직 파일 없음
+  if (res.status === 409 || res.status === 404) { setRev(null); return null; } // 아직 파일 없음
   if (res.status === 401) {
     if (!retried && await refreshAccessToken()) {
       return dbxDownload(true, attempt);
@@ -719,16 +720,41 @@ async function performAutoBackup(today) {
 function sameAsRemote(remote) {
   if (!remote || Array.isArray(remote)) return false;
   const key = (arr, f) => JSON.stringify((arr || []).map(f).sort());
-  const mk = (m) => m.id + ':' + m.updatedAt;
-  const fk = (f) => [f.id, f.name, f.parentId || '', f.sortOrder, f.updatedAt || 0, f.password || ''].join('|');
+  const mk = (m) => m.id + ':' + m.updatedAt + ':' + (m.metaAt || 0);
+  const fk = (f) => [f.id, f.name, f.parentId || '', f.sortOrder, f.updatedAt || 0, f.password || '', f.dormant ? 1 : 0].join('|');
   const tk = (t) => t.type + ':' + (t.data && t.data.id);
   const dk = (d) => d.id || d;
-  return key(memos, mk) === key(remote.memos, mk)
+  return key(syncableMemos(), mk) === key(remote.memos, mk)
     && key(folders, fk) === key(remote.folders, fk)
     && key(templates, mk) === key(remote.templates, mk)
     && key(trash, tk) === key(remote.trash, tk)
     && key(deletedIds, dk) === key(remote.deletedIds, dk)
-    && (!masterPasswordHash || remote.masterPassword === masterPasswordHash);
+    && (masterPasswordHash || null) === (remote.masterPassword || null)
+    && (masterPasswordAt || 0) === (remote.masterPasswordAt || 0);
+}
+
+// 올릴 글 = 빈 글(제목·본문 없고 폴더도 없음)을 뺀 나머지
+function syncableMemos() {
+  return memos.filter((m) => !isBlankMemo(m));
+}
+
+// 같은 글·폴더가 휴지통과 목록에 함께 있으면 늦게 일어난 일을 따른다.
+// 지운 시각이 마지막 수정보다 늦으면 휴지통, 복원(또는 그 뒤 수정)이 더 늦으면 목록.
+// 예전엔 휴지통을 기기끼리 합치기만 해서, 한 기기에서 복원해도 다른 기기 휴지통 때문에 다시 휴지통으로 갔다.
+function reconcileTrash() {
+  const liveMemo = new Map(memos.map((m) => [m.id, m]));
+  const liveFolder = new Map(folders.map((f) => [f.id, f]));
+  const dropMemo = new Set(), dropFolder = new Set();
+  trash = trash.filter((t) => {
+    const id = t.data && t.data.id;
+    const live = t.type === 'folder' ? liveFolder.get(id) : liveMemo.get(id);
+    if (!live) return true;
+    if ((live.updatedAt || 0) > (t.deletedAt || 0)) return false;   // 복원이 더 늦다 → 휴지통 항목을 버린다
+    (t.type === 'folder' ? dropFolder : dropMemo).add(id);          // 삭제가 더 늦다 → 목록에서 뺀다
+    return true;
+  });
+  if (dropMemo.size) memos = memos.filter((m) => !dropMemo.has(m.id));
+  if (dropFolder.size) folders = folders.filter((f) => !dropFolder.has(f.id));
 }
 
 // 원격 파일을 받아 이 기기 내용과 합친다 (올리지는 않는다). 파일이 없으면 true를 돌려준다.
@@ -742,10 +768,15 @@ async function pullAndMerge() {
     if (Array.isArray(remote.memos)) memos = mergeMemos(memos, remote.memos);
     if (Array.isArray(remote.folders)) folders = mergeFolders(folders, remote.folders);
     if (Array.isArray(remote.templates)) templates = mergeTemplates(templates, remote.templates);
-    if (remote.masterPassword && !masterPasswordHash) masterPasswordHash = remote.masterPassword;
+    const rAt = remote.masterPasswordAt || 0;
+    if (rAt > masterPasswordAt || (rAt === masterPasswordAt && !masterPasswordHash && remote.masterPassword)) {
+      masterPasswordHash = remote.masterPassword || null;
+      masterPasswordAt = rAt;
+    }
   } else if (remote && Array.isArray(remote)) {
     memos = mergeMemos(memos, remote);
   }
+  reconcileTrash();
   saveLocalData(false);
   if (sameAsRemote(remote)) markSynced();
   else localStorage.setItem('pending_sync', '1');
@@ -796,7 +827,7 @@ function syncFromDropbox() {
 
 // 이 기기에 내용이 하나도 없는 상태인가(글·폴더·템플릿·휴지통 모두 빔)
 function isLocalEmpty() {
-  return memos.length === 0 && folders.length === 0 && templates.length === 0 && trash.length === 0;
+  return syncableMemos().length === 0 && folders.length === 0 && templates.length === 0 && trash.length === 0;
 }
 
 // force=true 는 사용자가 직접 전부 지운 경우처럼 빈 상태를 일부러 올릴 때만
@@ -813,7 +844,8 @@ async function uploadNow(force, retriedConflict) {
     console.warn('빈 상태라 업로드를 건너뜀');
     return;
   }
-  const obj = { memos, folders, trash, deletedIds, templates };
+  // 아직 아무것도 안 쓴 빈 글은 올리지 않는다 — 기기마다 지웠다 되살렸다 하며 전송만 늘었다
+  const obj = { memos: syncableMemos(), folders, trash, deletedIds, templates, masterPasswordAt };
   if (masterPasswordHash) obj.masterPassword = masterPasswordHash;
   try {
     await dbxUpload(JSON.stringify(obj));   // 들여쓰기 없이 — 올리는 양이 줄어 휴대폰에서 끊길 일이 적다
@@ -856,8 +888,12 @@ function mergeMemos(local, remote) {
   for (const r of remote) {
     const l = localById.get(r.id);
     if (!l) { map.set(r.id, r); continue; }
-    const winner = (l.updatedAt || 0) >= (r.updatedAt || 0) ? l : r;
+    let winner = (l.updatedAt || 0) >= (r.updatedAt || 0) ? l : r;
     const loser = winner === l ? r : l;
+    // 즐겨찾기·보기모드는 글 내용과 따로 — 그쪽을 늦게 바꾼 기기의 값을 따른다
+    if ((loser.metaAt || 0) > (winner.metaAt || 0)) {
+      winner = { ...winner, favorite: loser.favorite, favoritedAt: loser.favoritedAt, viewerMode: loser.viewerMode, metaAt: loser.metaAt };
+    }
     map.set(r.id, winner);
     const base = syncBase[r.id];
     const bothEdited = base != null && (l.updatedAt || 0) > base && (r.updatedAt || 0) > base;
@@ -868,20 +904,18 @@ function mergeMemos(local, remote) {
     }
   }
   for (const m of local) if (!map.has(m.id)) map.set(m.id, m);
-  const trashMemoIds = new Set(trash.filter((t) => t.type === 'memo').map((t) => t.data.id));
   const permDelIds = new Set(deletedIds.map((d) => d.id || d));
   return Array.from(map.values()).concat(extras)
-    .filter((m) => !m.deleted && !trashMemoIds.has(m.id) && !permDelIds.has(m.id))
+    .filter((m) => !m.deleted && !permDelIds.has(m.id))
     .sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
 function mergeFolders(local, remote) {
-  const trashFolderIds = new Set(trash.filter((t) => t.type === 'folder').map((t) => t.data.id));
   const permDelIds = new Set(deletedIds.map((d) => d.id || d));
   const map = new Map();
-  for (const f of remote) { if (!trashFolderIds.has(f.id) && !permDelIds.has(f.id)) map.set(f.id, f); }
+  for (const f of remote) { if (!permDelIds.has(f.id)) map.set(f.id, f); }
   for (const f of local) {
-    if (trashFolderIds.has(f.id) || permDelIds.has(f.id)) continue;
+    if (permDelIds.has(f.id)) continue;
     const r = map.get(f.id);
     // 늦게 고친 쪽이 이긴다 (예전엔 원격이 늘 이겨, 이 기기에서 바꾼 이름·순서가 되돌아갔다)
     if (!r || (f.updatedAt || 0) > (r.updatedAt || 0)) map.set(f.id, f);
@@ -940,7 +974,7 @@ function markSynced() {
   localStorage.setItem('pending_sync', '0');
   // 지금 원격과 같아진 내용을 다음 합치기의 기준점으로 삼는다
   const base = {};
-  for (const m of memos) base[m.id] = m.updatedAt;
+  for (const m of syncableMemos()) base[m.id] = m.updatedAt;
   localStorage.setItem('sync_base', JSON.stringify(base));
   updateSaveSyncTimes();
 }
@@ -955,6 +989,7 @@ function saveLocalData(changed = true) {
   localStorage.setItem('templates', JSON.stringify(templates));
   if (masterPasswordHash) localStorage.setItem('master_pw', masterPasswordHash);
   else localStorage.removeItem('master_pw');
+  localStorage.setItem('master_pw_at', String(masterPasswordAt || 0));
   localStorage.setItem('last_saved_at', String(Date.now()));
   if (changed) localStorage.setItem('pending_sync', '1');   // 아직 클라우드로 못 보낸 변경이 있다
   updateSaveSyncTimes();
@@ -973,6 +1008,7 @@ function loadLocalData() {
     const tp = localStorage.getItem('templates');
     if (tp) templates = JSON.parse(tp);
     masterPasswordHash = localStorage.getItem('master_pw') || null;
+    masterPasswordAt = Number(localStorage.getItem('master_pw_at')) || 0;
     // 마이그레이션: sortOrder 없는 폴더에 순번 부여
     folders.forEach((f, i) => { if (f.sortOrder === undefined) f.sortOrder = i; });
   } catch {}
@@ -1024,6 +1060,7 @@ function toggleDormant(folderId) {
   const f = folders.find((x) => x.id === folderId);
   if (!f) return;
   f.dormant = !f.dormant;
+  f.updatedAt = Date.now();
   saveLocalData();
   renderAll();
   scheduleSyncToDropbox();
@@ -1185,6 +1222,7 @@ function showMasterPasswordDialog() {
     const confirmPw = overlay.querySelector('#mp-confirm').value;
     if (newPw === '' && confirmPw === '') {
       masterPasswordHash = null;
+      masterPasswordAt = Date.now();
       showToast('Master가 해제되었습니다');
     } else if (newPw !== confirmPw) {
       overlay.querySelector('#mp-confirm').value = '';
@@ -1193,6 +1231,7 @@ function showMasterPasswordDialog() {
       return;
     } else {
       masterPasswordHash = await hashPassword(newPw);
+      masterPasswordAt = Date.now();
       showToast('Master가 설정되었습니다');
     }
     saveLocalData();
@@ -1332,7 +1371,8 @@ function showMoveFolderDialog(id) {
   if (!folder) return;
   // 이동 가능한 대상: 최상위로 + 자기 자신과 자기 하위 폴더를 제외한 최상위 폴더
   const childIds = getChildFolders(id).map((f) => f.id);
-  const topFolders = folders.filter((f) => !f.parentId && f.id !== id && !childIds.includes(f.id)).sort(sortBySortOrder);
+  // 하위 폴더를 가진 폴더를 다른 폴더 아래로 넣으면 3단계가 되어 목록에서 보이지 않는다 → 최상위로만
+  const topFolders = childIds.length ? [] : folders.filter((f) => !f.parentId && f.id !== id && !childIds.includes(f.id)).sort(sortBySortOrder);
 
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
@@ -1643,6 +1683,7 @@ function restoreFromTrash(index) {
     if (item.data.folder && !folders.some((f) => f.id === item.data.folder)) {
       item.data.folder = null;
     }
+    item.data.updatedAt = Date.now();
     memos.unshift(item.data);
   } else if (item.type === 'folder') {
     // 같은 이름의 폴더가 이미 있으면 이름 뒤에 (복원) 추가
@@ -1669,6 +1710,7 @@ function toggleFavorite() {
   if (!memo) return;
   memo.favorite = !memo.favorite;
   memo.favoritedAt = memo.favorite ? Date.now() : null;
+  memo.metaAt = Date.now();   // 다른 기기로 전달되게 (글 수정 시각은 그대로 — 목록 순서가 바뀌지 않게)
   updateFavButton(memo);
   saveLocalData();
   renderAll();
@@ -1768,18 +1810,18 @@ function isBlankMemo(m) {
 }
 
 function cleanupEmptyMemo() {
-  // 현재 편집 중이 아닌 빈 메모를 모두 삭제
-  const before = memos.length;
-  memos = memos.filter((m) => m.id === currentId || !isBlankMemo(m));
-  // 현재 편집 중인 메모도 빈 상태면 삭제
-  if (currentId) {
-    const memo = memos.find((m) => m.id === currentId);
-    if (memo && isBlankMemo(memo)) {
-      memos = memos.filter((m) => m.id !== currentId);
-      currentId = null;
-    }
+  // 빈 메모를 모두 정리한다. 한 번도 올린 적 없는 빈 글은 그냥 지우고,
+  // 예전에 내용이 있어 올렸던 글을 비운 것이면 휴지통에 넣는다(다른 기기에서도 지워지고, 복원도 된다).
+  const blanks = memos.filter(isBlankMemo);
+  if (!blanks.length) return;
+  const base = getSyncBase();
+  for (const m of blanks) {
+    if (base[m.id] != null) trash.push({ type: 'memo', data: { ...m }, deletedAt: Date.now() });
   }
-  if (memos.length !== before) saveLocalData();
+  const ids = new Set(blanks.map((m) => m.id));
+  memos = memos.filter((m) => !ids.has(m.id));
+  if (currentId && ids.has(currentId)) currentId = null;
+  saveLocalData();
 }
 
 async function loadMemoInEditor(memo) {
@@ -1921,6 +1963,8 @@ function onEditorInput() {
   memo.content = editor.value;
   memo.updatedAt = Date.now();
   updateCharCount();
+  // 찾기 창이 열려 있으면 바뀐 본문으로 다시 센다(예전 위치를 칠하거나 바꾸지 않게)
+  if ($('#find-replace-bar').style.display !== 'none' && $('#find-input').value) { findCountOnly(); searchCurrentPos = -1; }
   repaintOverlay();
   scheduleLocalSave(); // 기기 저장은 0.4초 모아서 — 앱을 벗어날 때는 flushSave가 즉시 저장
   scheduleRenderAndSync();
@@ -1961,7 +2005,7 @@ function prevParagraphStart(text, pos) {
 // 길이는 창 크기와 무관하게 고정 (DIVIDER_LEN 글자)
 const DIVIDER_LEN = 59;
 function insertDivider(ch) {
-  if (document.activeElement !== editor) return;
+  if (document.activeElement !== editor || viewerMode) return;
   const line = ch.repeat(DIVIDER_LEN);
 
   const start = editor.selectionStart;
@@ -1990,7 +2034,7 @@ function formatDateStamp(withTime) {
 // 현재 포커스된 입력칸(본문 또는 제목) 커서 자리에 텍스트 삽입
 function insertTextAtCursor(text) {
   const el = document.activeElement;
-  if (el !== editor && el !== titleInput) return;
+  if ((el !== editor && el !== titleInput) || viewerMode) return;
   const start = el.selectionStart, end = el.selectionEnd;
   el.value = el.value.slice(0, start) + text + el.value.slice(end);
   const caret = start + text.length;
@@ -2086,6 +2130,7 @@ function toggleViewer() {
   if (!memo) return;
   const newMode = !viewerMode;
   memo.viewerMode = newMode;
+  memo.metaAt = Date.now();
   applyViewerMode(newMode);
   saveLocalData();
   scheduleSyncToDropbox();
@@ -2152,6 +2197,7 @@ function restoreEditorContent(newContent) {
 }
 
 function performUndo() {
+  if (viewerMode) { showToast('읽기 전용 보기입니다'); return; }
   if (undoStack.length === 0) {
     showToast('되돌릴 내용이 없습니다');
     return;
@@ -2181,6 +2227,7 @@ function performUndo() {
 }
 
 function performRedo() {
+  if (viewerMode) { showToast('읽기 전용 보기입니다'); return; }
   if (redoStack.length === 0) {
     showToast('되살릴 내용이 없습니다');
     return;
@@ -2536,6 +2583,13 @@ function highlightAllWithCurrent(keyword, currentPos) {
 }
 
 function scrollEditorToPos(pos) {
+  // 화면에서 접힌 줄까지 반영하려면 실제로 그려진 표시(오버레이의 현재 찾기 표시) 위치를 쓴다
+  const mk = $('#editor-highlight').querySelector('mark.search-current');
+  if (mk) {
+    editor.scrollTop = Math.max(0, mk.offsetTop - editor.clientHeight / 3);
+    $('#editor-highlight').scrollTop = editor.scrollTop;
+    return;
+  }
   const textBefore = editor.value.substring(0, pos);
   const lines = textBefore.split('\n').length - 1;
   const lineHeight = parseFloat(getComputedStyle(editor).lineHeight);
@@ -2678,10 +2732,28 @@ function deleteTemplate(templateId) {
 }
 
 function replaceAction() {
+  if (viewerMode) { showToast('읽기 전용 보기에서는 바꿀 수 없습니다'); return; }
   const keyword = $('#find-input').value;
   const replacement = $('#replace-input').value;
   if (!keyword || findMatches.length === 0) return;
   const oldContent = editor.value; // 형광펜 위치 보정용(교체 전 본문)
+  // 찾은 뒤 본문을 고쳤으면 기억해 둔 위치가 어긋나 엉뚱한 글자를 바꾼다 — 다시 찾고 멈춘다
+  if (!findAllMode) {
+    const p = findMatches[findIndex < 0 ? 0 : findIndex];
+    if (oldContent.substr(p, keyword.length).toLowerCase() !== keyword.toLowerCase()) {
+      findCountOnly();
+      if (findMatches.length) findNavigate(1);
+      showToast('본문이 바뀌어 다시 찾았습니다. 한 번 더 누르세요');
+      return;
+    }
+  }
+  // 바꾸기도 되돌릴 수 있게 바꾸기 전 본문을 남긴다
+  if (undoStack[undoStack.length - 1] !== oldContent) {
+    undoStack.push(oldContent);
+    if (undoStack.length > UNDO_MAX) undoStack.shift();
+  }
+  redoStack = [];
+  undoGroupOpen = false;
 
   if (findAllMode) {
     // 모두 찾기 상태 → 전체 바꾸기
@@ -2872,6 +2944,10 @@ function bulkMoveUnified() {
     overlay.querySelector('#bf-ok').onclick = () => {
       const target = overlay.querySelector('select').value;
       const newParent = target === '__top__' ? null : target;
+      if (newParent && [...selectedFolders].some((id) => getChildFolders(id).length)) {
+        showToast('하위 폴더가 있는 폴더는 최상위로만 옮길 수 있습니다');
+        return;
+      }
       for (const id of selectedFolders) {
         const f = folders.find((x) => x.id === id);
         if (f) {
@@ -3052,7 +3128,8 @@ function renderFolderList() {
         touchSelectActive = false;
       });
     });
-    folderList.addEventListener('touchmove', (e) => {
+    if (folderList._selMove) folderList.removeEventListener('touchmove', folderList._selMove);
+    folderList._selMove = (e) => {
       if (!touchSelectActive) return;
       const touch = e.touches[0];
       const target = document.elementFromPoint(touch.clientX, touch.clientY);
@@ -3068,7 +3145,11 @@ function renderFolderList() {
         const cb = selectableFolderItems[i].querySelector('.folder-item-checkbox');
         if (cb && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change')); }
       }
-    }, { passive: true });
+    };
+    folderList.addEventListener('touchmove', folderList._selMove, { passive: true });
+  } else if (folderList._selMove) {
+    folderList.removeEventListener('touchmove', folderList._selMove);
+    folderList._selMove = null;
   }
 
   folderList.querySelectorAll('.folder-item').forEach((el) => {
@@ -3258,7 +3339,8 @@ function renderMemoList() {
         touchSelectActive = false;
       });
     });
-    memoList.addEventListener('touchmove', (e) => {
+    if (memoList._selMove) memoList.removeEventListener('touchmove', memoList._selMove);
+    memoList._selMove = (e) => {
       if (!touchSelectActive) return;
       const touch = e.touches[0];
       const target = document.elementFromPoint(touch.clientX, touch.clientY);
@@ -3275,7 +3357,11 @@ function renderMemoList() {
         const cb = memoItems[i].querySelector('.memo-item-checkbox');
         if (cb && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change')); }
       }
-    }, { passive: true });
+    };
+    memoList.addEventListener('touchmove', memoList._selMove, { passive: true });
+  } else if (memoList._selMove) {
+    memoList.removeEventListener('touchmove', memoList._selMove);
+    memoList._selMove = null;
   }
 
   memoList.querySelectorAll('.memo-item').forEach((el, idx) => {
@@ -3331,10 +3417,12 @@ function setSyncStatus(cls, text) {
   syncStatus.textContent = text;
 }
 
+let toastTimer = null;
 function showToast(msg) {
   toast.textContent = msg;
   toast.classList.add('show');
-  setTimeout(() => toast.classList.remove('show'), 2500);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.remove('show'), 2500);
 }
 
 function formatDate(ts) {

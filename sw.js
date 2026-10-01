@@ -1,4 +1,4 @@
-const CACHE_NAME = 'memo-v144';
+const CACHE_NAME = 'memo-v145';
 const ASSETS = [
   '/project-papers/',
   '/project-papers/index.html',
@@ -42,22 +42,30 @@ self.addEventListener('fetch', (e) => {
     return;
   }
   const isPage = e.request.mode === 'navigate';
-  // Network first, fallback to cache
-  e.respondWith(
-    fetch(e.request)
-      .then((res) => {
-        if (res.ok && new URL(e.request.url).origin === location.origin) {
-          const clone = res.clone();
-          caches.open(CACHE_NAME).then((c) => c.put(e.request, clone));
-        }
-        return res;
-      })
-      .catch(async () => {
-        const hit = await caches.match(e.request, { ignoreSearch: isPage });
-        if (hit) return hit;
-        // 새 창(?memo=…)처럼 주소 뒤가 달라도 오프라인이면 앱 화면을 띄운다
-        if (isPage) return (await caches.match('/project-papers/')) || (await caches.match('/project-papers/index.html')) || Response.error();
-        return Response.error();
-      })
-  );
+  // 네트워크 우선 — 단, 통신이 느리면(지하철 등) 4초 뒤 저장해 둔 사본으로 연다.
+  // 예전엔 느린 통신에서 연결이 끊길 때까지 하얀 화면으로 기다렸다.
+  const net = fetch(e.request).then((res) => {
+    if (res.ok && new URL(e.request.url).origin === location.origin) {
+      const clone = res.clone();
+      caches.open(CACHE_NAME).then((c) => c.put(e.request, clone));
+    }
+    return res;
+  });
+  net.catch(() => {});
+  const cached = async () => {
+    const hit = await caches.match(e.request, { ignoreSearch: isPage });
+    if (hit) return hit;
+    // 새 창(?memo=…)처럼 주소 뒤가 달라도 앱 화면을 띄운다
+    if (isPage) return (await caches.match('/project-papers/')) || (await caches.match('/project-papers/index.html'));
+    return null;
+  };
+  e.respondWith((async () => {
+    try {
+      return await Promise.race([net, new Promise((_, rej) => setTimeout(() => rej(new Error('slow')), 4000))]);
+    } catch {
+      const hit = await cached();
+      if (hit) return hit;
+      try { return await net; } catch { return Response.error(); }   // 사본이 없으면 끝까지 기다린다
+    }
+  })());
 });
