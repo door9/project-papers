@@ -2,6 +2,20 @@
 const DROPBOX_CLIENT_ID = '0kfnwj8hluxzpun';
 // PKCE(공개 클라이언트) 방식이므로 app secret은 코드에 두지 않는다 (공개 저장소 노출 방지)
 const DROPBOX_FILE = '/project-papers/memos.json';
+// 동기화 규칙 버전. 옛 앱이 새 규칙의 데이터를 망가뜨릴 수 있게 바뀔 때만 올린다.
+// 파일의 dataVersion이 이 값보다 크면 이 앱은 올리지 않고 새로고침을 안내한다.
+const DATA_VERSION = 2;
+let outdatedClient = false;
+function markOutdated() {
+  if (outdatedClient) return;
+  outdatedClient = true;
+  showToast('새 버전이 나와 이 화면에서는 저장을 올리지 않습니다. 새로고침해 주세요');
+  // 한 세션에 한 번만 자동 새로고침 (새 코드를 받아 오게)
+  if (!sessionStorage.getItem('outdated_reloaded')) {
+    sessionStorage.setItem('outdated_reloaded', '1');
+    setTimeout(() => location.reload(), 1500);
+  }
+}
 const BACKUP_DIR = '/project-papers/backups';
 const BACKUP_MAX = 30;
 const REDIRECT_URI = location.origin + location.pathname;
@@ -529,6 +543,12 @@ async function dbxDownload(retried, attempt = 0) {
 }
 
 // ── Backup ──
+// 백업 파일 내용 — 동기화 파일과 같은 항목을 모두 담는다(예전엔 글·폴더만 담아 템플릿·휴지통이 빠졌다)
+function backupPayload() {
+  const obj = { memos, folders, trash, deletedIds, templates, masterPasswordAt, dataVersion: DATA_VERSION };
+  if (masterPasswordHash) obj.masterPassword = masterPasswordHash;
+  return obj;
+}
 async function createBackup() {
   if (!accessToken) {
     showToast('Dropbox에 로그인 후 이용하세요');
@@ -548,8 +568,7 @@ async function createBackup() {
       + String(now.getMinutes()).padStart(2, '0')
       + String(now.getSeconds()).padStart(2, '0');
     const backupPath = BACKUP_DIR + '/backup_' + ts + '.json';
-    const obj = { memos, folders };
-    if (masterPasswordHash) obj.masterPassword = masterPasswordHash;
+    const obj = backupPayload();
     const data = JSON.stringify(obj, null, 2);
 
     // 백업 파일 업로드
@@ -702,8 +721,7 @@ async function performAutoBackup(today) {
       + String(now.getMinutes()).padStart(2, '0')
       + String(now.getSeconds()).padStart(2, '0');
     const backupPath = BACKUP_DIR + '/backup_' + ts + ' (auto backup).json';
-    const obj = { memos, folders };
-    if (masterPasswordHash) obj.masterPassword = masterPasswordHash;
+    const obj = backupPayload();
     const data = JSON.stringify(obj, null, 2);
 
     await dbxUploadTo(backupPath, data);
@@ -757,12 +775,50 @@ function reconcileTrash() {
   if (dropFolder.size) folders = folders.filter((f) => !dropFolder.has(f.id));
 }
 
+// 이 기기가 지난번 동기화 때 갖고 있던(= 원격에도 있던) 그대로인가.
+// 기준점(sync_base)이 있으면 그것으로, 없으면 마지막 동기화 시각으로 판단한다.
+function syncedAndUnchanged(item, key) {
+  const b = getSyncBase()[key];
+  if (b != null) return (item.updatedAt || 0) <= b;
+  const last = Number(localStorage.getItem('last_synced_at')) || 0;
+  return last > 0 && (item.updatedAt || 0) > 0 && (item.updatedAt || 0) <= last;
+}
+
+// 원격에서 사라진 글·폴더 처리. 지난번 동기화 때 함께 있었고 이 기기에서 그 뒤 손대지 않았다면
+// 다른 기기에서 지운 것이다 → 다시 올리지 않고 휴지통으로 옮긴다(되살리지 않되, 혹시 몰라 복원은 가능).
+// 오래(30일 넘게) 쉰 기기가 옛 글을 '새 글'로 착각해 DB를 되돌리던 문제를 막는다.
+function retireGoneItems(remote) {
+  const now = Date.now();
+  if (Array.isArray(remote.memos)) {
+    const ids = new Set(remote.memos.map((m) => m.id));
+    const gone = memos.filter((m) => !ids.has(m.id) && !isBlankMemo(m) && syncedAndUnchanged(m, m.id));
+    if (gone.length) {
+      for (const m of gone) trash.push({ type: 'memo', data: { ...m }, deletedAt: now });
+      const g = new Set(gone.map((m) => m.id));
+      memos = memos.filter((m) => !g.has(m.id));
+    }
+  }
+  if (Array.isArray(remote.folders)) {
+    const ids = new Set(remote.folders.map((f) => f.id));
+    const base = getSyncBase();
+    const gone = folders.filter((f) => !ids.has(f.id) && base['f:' + f.id] != null && (f.updatedAt || 0) <= base['f:' + f.id]);
+    if (gone.length) {
+      for (const f of gone) trash.push({ type: 'folder', data: { ...f }, deletedAt: now });
+      const g = new Set(gone.map((f) => f.id));
+      folders = folders.filter((f) => !g.has(f.id));
+    }
+  }
+}
+
 // 원격 파일을 받아 이 기기 내용과 합친다 (올리지는 않는다). 파일이 없으면 true를 돌려준다.
 // 합친 결과가 원격과 다르면 '보낼 것 있음'으로, 같으면 '동기화됨'으로 표시한다.
 async function pullAndMerge() {
   lastPullAt = Date.now();
   const remote = await dbxDownload();
   if (remote && typeof remote === 'object' && !Array.isArray(remote)) {
+    // 이 앱보다 새 규칙으로 쓰인 파일이면 올리지 않는다(옛 화면이 새 데이터를 망가뜨리지 않게)
+    if ((remote.dataVersion || 0) > DATA_VERSION) markOutdated();
+    retireGoneItems(remote);
     if (Array.isArray(remote.deletedIds)) deletedIds = mergeDeletedIds(deletedIds, remote.deletedIds);
     if (Array.isArray(remote.trash)) trash = mergeTrash(trash, remote.trash);
     if (Array.isArray(remote.memos)) memos = mergeMemos(memos, remote.memos);
@@ -837,7 +893,7 @@ function syncToDropbox(force) {
 }
 
 async function uploadNow(force, retriedConflict) {
-  if (!accessToken) return;
+  if (!accessToken || outdatedClient) return;
   // 안전장치: 빈 내용으로 Dropbox 파일을 덮어쓰지 않는다.
   // (경로가 어긋나거나 로그인 직후 아직 못 받아온 상태에서 올리면 원격 노트가 날아간다)
   if (!force && isLocalEmpty()) {
@@ -845,7 +901,7 @@ async function uploadNow(force, retriedConflict) {
     return;
   }
   // 아직 아무것도 안 쓴 빈 글은 올리지 않는다 — 기기마다 지웠다 되살렸다 하며 전송만 늘었다
-  const obj = { memos: syncableMemos(), folders, trash, deletedIds, templates, masterPasswordAt };
+  const obj = { memos: syncableMemos(), folders, trash, deletedIds, templates, masterPasswordAt, dataVersion: DATA_VERSION };
   if (masterPasswordHash) obj.masterPassword = masterPasswordHash;
   try {
     await dbxUpload(JSON.stringify(obj));   // 들여쓰기 없이 — 올리는 양이 줄어 휴대폰에서 끊길 일이 적다
@@ -938,19 +994,15 @@ function mergeTrash(local, remote) {
   return Array.from(map.values()).sort((a, b) => b.deletedAt - a.deletedAt);
 }
 
+// 영구 삭제 기록은 지우지 않는다. 예전엔 30일 뒤 지웠더니, 30일 넘게 안 켠 기기가 자기에게 남은 글을
+// '새 글'로 보고 다시 올려 지운 글이 되살아났다. 한 건에 수십 바이트라 계속 쌓여도 부담이 없다.
 function mergeDeletedIds(local, remote) {
   const map = new Map();
-  for (const d of remote) {
-    const item = typeof d === 'string' ? { id: d, at: Date.now() } : d;
-    map.set(item.id, item);
-  }
-  for (const d of local) {
-    const item = typeof d === 'string' ? { id: d, at: Date.now() } : d;
+  for (const d of remote.concat(local)) {
+    const item = typeof d === 'string' ? { id: d, at: 0 } : d;
     if (!map.has(item.id)) map.set(item.id, item);
   }
-  // 30일 지난 항목 자동 정리
-  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
-  return Array.from(map.values()).filter((d) => d.at > cutoff);
+  return Array.from(map.values());
 }
 
 // ── Local Storage ──
@@ -975,6 +1027,7 @@ function markSynced() {
   // 지금 원격과 같아진 내용을 다음 합치기의 기준점으로 삼는다
   const base = {};
   for (const m of syncableMemos()) base[m.id] = m.updatedAt;
+  for (const f of folders) base['f:' + f.id] = f.updatedAt || 0;
   localStorage.setItem('sync_base', JSON.stringify(base));
   updateSaveSyncTimes();
 }
@@ -2499,9 +2552,56 @@ function repaintOverlay() {
       marks.push({ start: pos, end: pos + kl, cls });
     }
   }
-  if (marks.length === 0) { hl.innerHTML = ''; return; } // 표시할 게 없으면 비움(성능)
-  hl.innerHTML = renderMarks(editor.value, marks);
+  if (marks.length === 0) {   // 표시할 게 없으면 비움
+    if (overlayKeys.length || hl.firstChild) { hl.textContent = ''; overlayKeys = []; }
+    return;
+  }
+  paintOverlayLines(hl, editor.value, marks);
   hl.scrollTop = editor.scrollTop;
+}
+
+// 겹침층을 줄(엔터로 나뉜 문단)마다 <div> 하나로 그리고, 지난번과 달라진 줄만 바꿔 끼운다.
+// 예전엔 글자 하나 칠 때마다 글 전체를 다시 만들어 넣어, 긴 글(30만 자)에서 한 글자에 100ms 넘게 걸렸다.
+// 줄마다 '열쇠'(그 줄 글자 + 그 줄 안의 표시)를 만들어 비교하고, 앞뒤로 같은 줄은 그대로 둔다.
+let overlayKeys = [];
+function paintOverlayLines(hl, text, marks) {
+  const lines = text.split('\n');
+  marks.sort((a, b) => a.start - b.start);
+  const keys = new Array(lines.length);
+  const lineMarks = new Array(lines.length);
+  let pos = 0, mi = 0;
+  let active = [];
+  for (let i = 0; i < lines.length; i++) {
+    const s = pos, e = pos + lines[i].length;
+    while (mi < marks.length && marks[mi].start < e) active.push(marks[mi++]);
+    active = active.filter((m) => m.end > s);
+    const rel = [];
+    for (const m of active) {
+      const a = Math.max(m.start, s) - s, b = Math.min(m.end, e) - s;
+      if (b > a) rel.push({ start: a, end: b, cls: m.cls });
+    }
+    lineMarks[i] = rel;
+    keys[i] = rel.length ? lines[i] + '\u0001' + rel.map((r) => r.start + ',' + r.end + ',' + r.cls).join(';') : lines[i];
+    pos = e + 1;
+  }
+  // 지금 그려진 것과 맞지 않으면(다른 글로 바뀐 직후 등) 전부 새로
+  if (hl.childElementCount !== overlayKeys.length) { hl.textContent = ''; overlayKeys = []; }
+  const old = overlayKeys;
+  let a = 0;
+  while (a < keys.length && a < old.length && keys[a] === old[a]) a++;
+  let b = 0;
+  while (b < keys.length - a && b < old.length - a && keys[keys.length - 1 - b] === old[old.length - 1 - b]) b++;
+  // 바뀐 구간: 옛 [a, old.length-b) → 새 [a, keys.length-b)
+  for (let k = old.length - b - 1; k >= a; k--) hl.children[k].remove();
+  const ref = hl.children[a] || null;
+  const frag = document.createDocumentFragment();
+  for (let k = a; k < keys.length - b; k++) {
+    const div = document.createElement('div');
+    div.innerHTML = lines[k] ? renderMarks(lines[k], lineMarks[k]) : '\u200b';   // 빈 줄도 한 줄 높이를 차지하게
+    frag.appendChild(div);
+  }
+  hl.insertBefore(frag, ref);
+  overlayKeys = keys;
 }
 
 // 겹칠 수 있는 표시들을 우선순위(현재 찾기 > 찾기 > 형광펜)로 합쳐 <mark> HTML 생성
@@ -2527,7 +2627,7 @@ function renderMarks(text, marks) {
     const seg = escHtml(text.slice(a, b));
     out += best ? '<mark class="' + best + '">' + seg + '</mark>' : seg;
   }
-  return out + '\n';
+  return out;
 }
 
 function updateHighlight(keyword) {
