@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Project Papers</title>
+<script>
+  // 주소가 바뀌었다: /project-papers/ → /projectpapers/. 뒤에 붙은 것(?memo=… 등)은 그대로 넘기고,
+  // 새 앱이 '설치한 앱을 다시 설치하라'고 알릴 수 있게 moved=1 을 붙인다.
+  (function () {
+    var rest = location.pathname.replace(/^\/project-papers\/?/, '').replace(/^index\.html$/, '');
+    var q = new URLSearchParams(location.search);
+    q.set('moved', '1');
+    location.replace('/projectpapers/' + rest + '?' + q.toString() + location.hash);
+  })();
+</script>
+<style>
+  body { margin: 0; padding: 48px 16px; background: #fff1e5; color: #33302e; font: 16px/1.6 -apple-system, "Segoe UI", sans-serif; text-align: center; }
+  a { color: #0d7680; }
+</style>
+</head>
+<body>
+<p>Project Papers 주소가 바뀌었습니다.</p>
+<p><a href="/projectpapers/">https://door9.github.io/projectpapers/</a></p>
+</body>
+</html>
